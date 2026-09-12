@@ -21,6 +21,7 @@ tutor-*/
 **/result.json
 **/artifacts.json
 **/config.json
+!experiments/window/config.json
 **/review.html
 *.mp4
 *.mov

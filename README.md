@@ -9,7 +9,7 @@ An adapter is not a standalone video model and does not guarantee likeness.
 ```bash
 git clone https://github.com/spivi/wan-lora-example.git
 cd wan-lora-example
-git checkout v1.0.0
+git checkout v1.0.1
 ```
 
 No training footage, model weights or API keys are included.
@@ -84,7 +84,10 @@ to anyone holding them; treat run files as private. Review provider retention an
 deletion controls before uploading sensitive material. Open weights do not make
 this hosted route offline or private by default.
 
-A durable `intent.json` is written before submitting training. A successful
+An atomic `intent.json` is written before submitting training. On POSIX, both
+the file and containing directory are synchronized; other platforms synchronize
+the file only. This is not a guarantee against every filesystem or hardware failure.
+A successful
 submission saves `receipt.json`. Repeating submit after a receipt is a no-op;
 repeating it after an intent without a receipt is blocked, because the previous
 request might already have been accepted and charged. Upload retries may upload
@@ -103,6 +106,15 @@ in `artifacts.json`. The script uses the endpoint's documented `lora_file` and
 2 GiB limit per file; redirects are refused. If the provider changes hosts, inspect
 the result and update the allowlist deliberately, not by disabling checks.
 
+Collection checks the config is a JSON object and validates the safetensors header,
+shapes, byte lengths and contiguous offsets without loading tensor values. JSON
+and tensor headers are limited to 16 MiB. This narrow validator supports ordinary
+1/2/4/8-byte dtypes, not packed or experimental types. Unsupported formats fail
+closed. Both files must pass before `validation.json` records their hashes as
+structurally valid; compatibility remains explicitly unchecked. A file on disk
+alone means downloaded, not validated. Validation records apply only to their
+recorded hashes. Partial downloads remain as `.part` files and can be retried.
+
 The hash detects changes between downloads; it is not a signature or proof of
 training quality. Keep the configuration with the adapter and check the target
 model's layer/stage compatibility before inference. This companion does not
@@ -120,6 +132,9 @@ validate internal layer loading or generate evaluation clips automatically.
 
   This trusts the ID you supply; it cannot independently prove that the recovered
   job used your dataset. Keep the dashboard confirmation with the run record.
+  A candidate ID is saved only after a recognized status response. A failed lookup
+  leaves it uncommitted, so a typo can be corrected by repeating this command.
+  An existing receipt cannot be replaced this way.
 - If no job can be located, resolve the uncertain submission with the provider
   before deliberately starting a new one. HTTP errors are not assumed free.
 - A failed provider job is not automatically retrained. Inspect its dashboard
@@ -146,12 +161,19 @@ assistant pipeline. No automatic generation is included to avoid surprise charge
 python -m unittest -v test_wan_lora.py
 ```
 
-Tests mock all remote calls. Local FFmpeg preparation is smoke-tested separately;
+The 28 offline tests include recovery lookup failures, HTTP response lengths,
+redirect refusal, malformed artifacts and interrupted collection. All remote calls
+are mocked. Local FFmpeg preparation is smoke-tested separately;
 this wrapper has not submitted a paid training job. Its API fields and
 queue routes are checked against the documented interface and the article's saved
 training receipt. The paid path has not been tested end to end.
 
-Sources: [training API](https://fal.ai/models/fal-ai/wan-22-trainer/i2v-a14b/api),
+The [window experiment record](experiments/window/README.md) includes sanitized
+requests and links to the published clips. It documents a selected example, not
+a demonstrated improvement over the baseline.
+
+Sources: [safetensors format](https://github.com/safetensors/safetensors#format),
+[training API](https://fal.ai/models/fal-ai/wan-22-trainer/i2v-a14b/api),
 [WAN code and model weights](https://github.com/Wan-Video/Wan2.2).
 Provider interfaces, pricing and model licenses can change; check before use.
 

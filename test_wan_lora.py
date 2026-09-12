@@ -1,13 +1,25 @@
 """Offline tests: no keys, uploads or paid requests are used."""
 import argparse
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import wan_lora as w
+
+
+def tensor_file(header=None, data=b"\0\0"):
+    raw = json.dumps(header or {"weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}).encode()
+    return len(raw).to_bytes(8, "little") + raw + data
+
+
+def response(data, length=None):
+    stream = io.BytesIO(data)
+    stream.headers = {} if length is None else {"Content-Length": str(length)}
+    return stream
 
 
 class CompanionTests(unittest.TestCase):
@@ -110,13 +122,140 @@ class CompanionTests(unittest.TestCase):
         result = {"lora_file": {"url": "https://v3.fal.media/lora"},
                   "config_file": {"url": "https://v3.fal.media/config"}}
         def download(url, path):
-            path.write_bytes(b"test artifact")
+            path.write_bytes(b"{}" if path.suffix == ".json" else tensor_file())
         with patch.object(w, "request_json", side_effect=[{"status": "COMPLETED"}, result] * 2), \
              patch.object(w, "download", side_effect=download) as fetch:
             w.collect(self.args)
             w.collect(self.args)
             self.assertEqual(fetch.call_count, 2)
             self.assertEqual(len(w.read(self.run / "artifacts.json")), 2)
+            self.assertEqual(w.read(self.run / "validation.json")["model_compatibility"], "not checked")
+
+    def test_recovery_lookup_failure_can_be_corrected(self):
+        w.save(self.run / "intent.json", {"keep": "original"})
+        self.args.request_id = "typo"
+        error = w.urllib.error.HTTPError("https://queue.fal.run/x", 404, "missing", {}, None)
+        with patch.object(w, "request_json", side_effect=error):
+            with self.assertRaises(w.urllib.error.HTTPError):
+                w.collect(self.args)
+        self.assertFalse((self.run / "receipt.json").exists())
+        self.args.request_id = "correct"
+        with patch.object(w, "request_json", return_value={"status": "IN_QUEUE"}):
+            w.collect(self.args)
+        self.assertEqual(w.read(self.run / "receipt.json")["request_id"], "correct")
+        self.assertEqual(w.read(self.run / "intent.json"), {"keep": "original"})
+
+    def test_malformed_recovery_status_does_not_save_receipt(self):
+        w.save(self.run / "intent.json", {})
+        self.args.request_id = "candidate"
+        for status in ([], {}, {"status": "surprise"}):
+            with patch.object(w, "request_json", return_value=status):
+                with self.assertRaises(ValueError):
+                    w.collect(self.args)
+            self.assertFalse((self.run / "receipt.json").exists())
+
+    def test_download_http_length_and_limits(self):
+        target = self.run / "artifact"
+        for data, length, limit in ((b"abc", 5, 10), (b"abc", 2, 10),
+                                    (b"abc", 3, 2), (b"abc", None, 2), (b"", None, 10)):
+            opener = Mock()
+            opener.open.return_value = response(data, length)
+            with patch.object(w.urllib.request, "build_opener", return_value=opener), patch.object(w, "MAX_DOWNLOAD", limit):
+                with self.assertRaises(ValueError):
+                    w.download("https://fal.media/file", target)
+            self.assertFalse(target.exists())
+
+    def test_download_valid_http_response(self):
+        opener = Mock()
+        opener.open.return_value = response(b"abc", 3)
+        target = self.run / "artifact"
+        with patch.object(w.urllib.request, "build_opener", return_value=opener):
+            w.download("https://fal.media/file", target)
+        self.assertEqual(target.read_bytes(), b"abc")
+
+    def test_redirect_handler_refuses_forwarding(self):
+        request = w.urllib.request.Request("https://queue.fal.run/x", headers={"Authorization": "Key secret"})
+        with self.assertRaises(ValueError):
+            w.NoRedirect().redirect_request(request, None, 302, "redirect", {}, "https://evil.example")
+
+    def test_request_json_http_boundary(self):
+        opener = Mock()
+        opener.open.return_value = response(b'{"status":"IN_QUEUE"}')
+        with patch.object(w.urllib.request, "build_opener", return_value=opener):
+            self.assertEqual(w.request_json(w.QUEUE + "x")["status"], "IN_QUEUE")
+        req = opener.open.call_args.args[0]
+        self.assertEqual(req.get_header("Authorization"), "Key offline-test-key")
+
+    def test_config_validation(self):
+        target = self.run / "config.json"
+        for raw in (b"<html>error</html>", b"[]", b'{"a":NaN}', b'{"a":1,"a":2}', b"\xff"):
+            target.write_bytes(raw)
+            with self.assertRaises(ValueError):
+                w.validate_artifact(target)
+        target.write_bytes(b"{}")
+        w.validate_artifact(target)
+        with patch.object(w, "MAX_JSON", 1), self.assertRaises(ValueError):
+            w.validate_artifact(target)
+
+    def test_tensor_validation(self):
+        target = self.run / "adapter.safetensors"
+        bad = [b"<html>error</html>", (w.MAX_JSON + 1).to_bytes(8, "little"), tensor_file(data=b"\0"),
+               tensor_file(data=b"\0\0extra")]
+        for entry in ({"dtype": "F16", "shape": [2], "data_offsets": [0, 2]},
+                      {"dtype": "F16", "shape": [True], "data_offsets": [0, 2]},
+                      {"dtype": "unknown", "shape": [1], "data_offsets": [0, 2]}):
+            bad.append(tensor_file({"weight": entry}))
+        for raw in bad:
+            target.write_bytes(raw)
+            with self.assertRaises(ValueError):
+                w.validate_artifact(target)
+        target.write_bytes(tensor_file())
+        w.validate_artifact(target)
+
+    def test_collection_rejects_invalid_artifacts(self):
+        w.save(self.run / "receipt.json", {"request_id": "job-123"})
+        result = {"lora_file": {"url": "https://fal.media/lora"}, "config_file": {"url": "https://fal.media/config"}}
+        for invalid_name in ("adapter.safetensors", "config.json"):
+            def fetch(url, path):
+                path.write_bytes(b"<html>bad</html>" if path.name == invalid_name else
+                                 (b"{}" if path.suffix == ".json" else tensor_file()))
+            with patch.object(w, "request_json", side_effect=[{"status": "COMPLETED"}, result]), \
+                 patch.object(w, "download", side_effect=fetch):
+                with self.assertRaises(ValueError):
+                    w.collect(self.args)
+            self.assertFalse((self.run / "validation.json").exists())
+            self.assertFalse((self.run / "artifacts.json").exists())
+
+    def test_interrupted_collection_can_resume(self):
+        w.save(self.run / "receipt.json", {"request_id": "job-123"})
+        result = {"lora_file": {"url": "https://fal.media/lora"}, "config_file": {"url": "https://fal.media/config"}}
+        def fetch(url, path):
+            if path.suffix == ".json":
+                raise TimeoutError()
+            path.write_bytes(tensor_file())
+        with patch.object(w, "request_json", side_effect=[{"status": "COMPLETED"}, result]), patch.object(w, "download", side_effect=fetch):
+            with self.assertRaises(TimeoutError):
+                w.collect(self.args)
+        self.assertFalse((self.run / "validation.json").exists())
+        def retry(url, path):
+            path.write_bytes(b"{}" if path.suffix == ".json" else tensor_file())
+        with patch.object(w, "request_json", side_effect=[{"status": "COMPLETED"}, result]), patch.object(w, "download", side_effect=retry):
+            w.collect(self.args)
+        self.assertTrue((self.run / "validation.json").exists())
+
+    def test_malformed_result_does_not_download(self):
+        w.save(self.run / "receipt.json", {"request_id": "job-123"})
+        for result in ([], {}, {"lora_file": {"url": 5}, "config_file": {}}):
+            with patch.object(w, "request_json", side_effect=[{"status": "COMPLETED"}, result]), patch.object(w, "download") as fetch:
+                with self.assertRaises(ValueError):
+                    w.collect(self.args)
+                fetch.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX directory sync")
+    def test_save_syncs_file_and_directory(self):
+        with patch.object(w.os, "fsync") as sync:
+            w.save(self.run / "example.json", {})
+        self.assertEqual(sync.call_count, 2)
 
     def test_recovery_cannot_replace_known_receipt(self):
         w.save(self.run / "intent.json", {})

@@ -1,0 +1,12 @@
+{
+  "sha256": "cc30fd386a3638985046e0b651e7c704bce46d168de1dbb76e5195659af96d25",
+  "bytes": 153453160,
+  "tensor_count": 800,
+  "stored_values": 76677120,
+  "dtype_shape_counts": {
+    "BF16:16x5120": 360,
+    "BF16:5120x16": 360,
+    "BF16:13824x16": 40,
+    "BF16:16x13824": 40
+  }
+}
